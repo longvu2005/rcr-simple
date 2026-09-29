@@ -15,9 +15,41 @@ class InputError(ValueError):
     pass
 
 
+def validate_email(value: object, *, required: bool = False) -> str | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if required:
+            raise InputError("email is required")
+        return None
+    if not isinstance(value, str):
+        raise InputError("email must be text")
+    email = value.strip()
+    if len(email) > 254 or email.count("@") != 1 or any(c.isspace() for c in email):
+        raise InputError("invalid email address")
+    local, domain = email.rsplit("@", 1)
+    if (
+        not local
+        or len(local) > 64
+        or local.startswith(".")
+        or local.endswith(".")
+        or ".." in local
+        or not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+", local)
+        or len(domain) > 253
+        or not all(
+            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+            for label in domain.split(".")
+        )
+    ):
+        raise InputError("invalid email address")
+    return local + "@" + domain.lower()
+
+
 def phrase(value: object, label: str, limit: int = 800) -> str:
     if not isinstance(value, str):
         raise InputError(f"{label} must be text")
+    try:
+        value.encode("utf-8")
+    except UnicodeError as exc:
+        raise InputError(f"{label} contains invalid Unicode") from exc
     value = re.sub(r"\s+", " ", value).strip(" .;,\t\n")
     if len(value) > limit:
         raise InputError(f"{label} is too long (maximum {limit} characters)")
@@ -52,7 +84,10 @@ def boxes(value: object, label: str) -> list[dict]:
     for box in value:
         if not isinstance(box, dict):
             raise InputError(f"{label} has an invalid box")
-        identity = str(box.get("identity_id", box.get("label", ""))).strip()
+        identity = box.get("identity_id", box.get("label", ""))
+        if type(identity) not in (str, int):
+            raise InputError(f"{label}: identity_id must be text or an integer")
+        identity = str(identity).strip()
         if not identity or len(identity) > 100 or identity in seen:
             raise InputError(f"{label} has an empty or duplicate identity")
         seen.add(identity)
@@ -158,11 +193,14 @@ def normalize_annotation(
         raise InputError(f"{case} requires {needed} subject(s)")
     normalized_subjects, used = [], set()
     for position, subject in enumerate(subjects, 1):
-        if not isinstance(subject, dict) or subject.get("subject_id") != position:
+        if (not isinstance(subject, dict) or type(subject.get("subject_id")) is not int
+                or subject["subject_id"] != position):
             raise InputError("subject_id must be 1 then 2")
         ids = subject.get("identity_ids")
         if not isinstance(ids, list):
             raise InputError(f"Subject {position} needs an identity_ids list")
+        if any(type(identity) not in (str, int) for identity in ids):
+            raise InputError("identity_ids must contain only text or integers")
         ids = [str(i) for i in ids]
         if len(ids) != len(set(ids)) or any(
             i not in candidate_ids or i in used for i in ids

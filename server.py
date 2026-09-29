@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import errno
 import getpass
@@ -33,8 +32,9 @@ from core import (
     normalize_annotation,
     normalize_task,
     parse_json_tasks,
+    validate_email,
 )
-from persistence import backup_database, write_snapshot
+from persistence import backup_database, export_record, write_snapshot
 
 STATIC = Path(__file__).with_name("static")
 COOKIE = "rcr_session"
@@ -69,7 +69,8 @@ def init_database(path: Path) -> None:
         db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('ADMIN','ANNOTATOR')),
+            email TEXT, password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('ADMIN','ANNOTATOR')),
             active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sessions (
@@ -93,18 +94,66 @@ def init_database(path: Path) -> None:
         CREATE INDEX IF NOT EXISTS tasks_case_split ON tasks(case_type,split);
         CREATE TABLE IF NOT EXISTS annotations (
             task_id TEXT PRIMARY KEY REFERENCES tasks(sample_id) ON DELETE CASCADE,
-            author_id INTEGER REFERENCES users(id), data_json TEXT NOT NULL,
+            author_id INTEGER REFERENCES users(id), annotator_email TEXT,
+            data_json TEXT NOT NULL,
             submitted INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS annotation_history (
             id INTEGER PRIMARY KEY, task_id TEXT NOT NULL,
-            author_id INTEGER, data_json TEXT NOT NULL,
+            author_id INTEGER, annotator_email TEXT, data_json TEXT NOT NULL,
             submitted INTEGER NOT NULL, archived_at INTEGER NOT NULL,
             reason TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS annotations_author ON annotations(author_id,submitted);
         CREATE INDEX IF NOT EXISTS history_author ON annotation_history(author_id,submitted,task_id);
         """)
+        # Additive migrations keep databases created by earlier releases usable.
+        db.execute("BEGIN IMMEDIATE")
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "email" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        annotation_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(annotations)")
+        }
+        if "annotator_email" not in annotation_columns:
+            db.execute("ALTER TABLE annotations ADD COLUMN annotator_email TEXT")
+        history_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(annotation_history)")
+        }
+        if "annotator_email" not in history_columns:
+            db.execute("ALTER TABLE annotation_history ADD COLUMN annotator_email TEXT")
+        task_columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+        if "reopened" not in task_columns:
+            db.execute("ALTER TABLE tasks ADD COLUMN reopened INTEGER NOT NULL DEFAULT 0")
+            # Older reopened rows retain final text until their first draft save.
+            for row in db.execute("""
+                SELECT t.sample_id,a.data_json FROM tasks t
+                JOIN annotations a ON a.task_id=t.sample_id
+                WHERE t.status='IN_PROGRESS' AND a.submitted=0
+            """).fetchall():
+                if "final_instruction" in json.loads(row["data_json"]):
+                    db.execute("UPDATE tasks SET reopened=1 WHERE sample_id=?", (row["sample_id"],))
+        # Keep completion counts stable across reopen/edit/reassign cycles without
+        # adding duplicate annotation versions to annotation_history.
+        db.execute("""CREATE TABLE IF NOT EXISTS task_completions (
+            task_id TEXT NOT NULL REFERENCES tasks(sample_id) ON DELETE CASCADE,
+            author_id INTEGER NOT NULL REFERENCES users(id),
+            PRIMARY KEY(task_id,author_id)
+        )""")
+        db.execute("""INSERT OR IGNORE INTO task_completions(task_id,author_id)
+            SELECT a.task_id,a.author_id FROM annotations a
+            JOIN tasks t ON t.sample_id=a.task_id JOIN users u ON u.id=a.author_id
+            WHERE a.submitted=1 OR t.reopened=1
+            UNION
+            SELECT h.task_id,h.author_id FROM annotation_history h
+            JOIN tasks t ON t.sample_id=h.task_id JOIN users u ON u.id=h.author_id
+            WHERE h.submitted=1
+        """)
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique "
+            "ON users(email COLLATE NOCASE) WHERE email IS NOT NULL"
+        )
+        db.commit()
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -124,11 +173,11 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-def parse_bulk_users(text: str) -> list[tuple[str, str]]:
-    """Parse CSV lines (username,password); reject the whole batch on any error."""
+def parse_bulk_users(text: str) -> list[tuple[str, str | None, str]]:
+    """Parse username,password or username,email,password CSV atomically."""
     if not isinstance(text, str) or len(text.encode("utf-8")) > 30_000:
         raise InputError("user list must be text under 30 KB")
-    users: list[tuple[str, str]] = []
+    users: list[tuple[str, str | None, str]] = []
     seen: set[str] = set()
     try:
         for line, row in enumerate(
@@ -136,9 +185,19 @@ def parse_bulk_users(text: str) -> list[tuple[str, str]]:
         ):
             if not row:
                 continue
-            if len(row) != 2:
-                raise InputError(f"line {line}: expected username,password")
-            username, password = row[0].strip(), row[1]
+            if len(row) == 2:
+                username, password = row[0].strip(), row[1]
+                email = None
+            elif len(row) == 3:
+                username, email_value, password = row[0].strip(), row[1], row[2]
+                try:
+                    email = validate_email(email_value, required=True)
+                except InputError as exc:
+                    raise InputError(f"line {line}: {exc}") from exc
+            else:
+                raise InputError(
+                    f"line {line}: expected username,password or username,email,password"
+                )
             if not re.fullmatch(r"[A-Za-z0-9_.-]{3,40}", username):
                 raise InputError(f"line {line}: invalid username")
             if username in seen:
@@ -148,7 +207,7 @@ def parse_bulk_users(text: str) -> list[tuple[str, str]]:
                     f"line {line}: password must have at least 4 characters"
                 )
             seen.add(username)
-            users.append((username, password))
+            users.append((username, email, password))
             if len(users) > 200:
                 raise InputError("create at most 200 users per batch")
     except csv.Error as exc:
@@ -173,6 +232,14 @@ def validate_import(
     for line, raw in enumerate(rows, 1):
         try:
             item = normalize_task(raw)
+            imported_email = validate_email(
+                raw.get("annotator_email"), required=False
+            )
+            if imported_email is not None and item["imported_annotation"] is None:
+                raise InputError(
+                    "annotator_email is only valid when the row contains an imported annotation"
+                )
+            item["imported_annotator_email"] = imported_email
             sid = item["sample_id"]
             if sid in seen:
                 raise InputError(f"duplicate sample_id in import: {sid}")
@@ -202,6 +269,7 @@ def row_task(row: sqlite3.Row, include_images: bool = False) -> dict:
         "revision": row["revision"],
         "updated_at": iso(row["updated_at"]),
         "submitted_at": iso(row["submitted_at"]),
+        "reopened": bool(row["reopened"]),
     }
     if include_images:
         sid = quote(row["sample_id"], safe="")
@@ -223,19 +291,6 @@ def row_task(row: sqlite3.Row, include_images: bool = False) -> dict:
     return result
 
 
-def export_row(row: sqlite3.Row, annotation: dict) -> dict:
-    return {
-        "sample_id": row["sample_id"],
-        "case_type": annotation["case_type"],
-        "query_image_id": row["query_image_id"],
-        "target_image_ids": json.loads(row["target_image_ids_json"]),
-        "subjects": annotation["subjects"],
-        "final_desc": annotation["final_desc"],
-        "final_change": annotation["final_change"],
-        "final_instruction": annotation["final_instruction"],
-    }
-
-
 def local_image(image_root: Path | None, relative: str) -> Path:
     if image_root is None:
         raise InputError("RCR_IMAGE_ROOT is not configured")
@@ -250,61 +305,54 @@ def local_image(image_root: Path | None, relative: str) -> Path:
 def gemini_suggestion(
     model: str,
     key: str,
-    query: Path,
-    target: Path,
     case: str,
     subjects: list[dict],
     descriptions: list[str],
     previous: str,
     note: str,
-    query_boxes: list[dict],
-    target_boxes: list[dict],
 ) -> dict:
     if not re.fullmatch(r"[a-zA-Z0-9._-]{1,100}", model):
         raise InputError("invalid RCR_GEMINI_MODEL")
     case_rule = {
-        "INDIVIDUAL": "Describe a change/state of Subject 1 only.",
-        "GROUP": "Subject 1 is a group: describe its members together; do not pretend it is one person.",
-        "DUAL": "Describe independent changes for Subject 1 and Subject 2; do not invent a relation.",
-        "RELATIONAL": "Describe an explicit directed relationship, who does what to whom, between Subject 1 and Subject 2.",
+        "INDIVIDUAL": "Edit the TARGET draft so it describes a change/state of Subject 1 only.",
+        "GROUP": "Edit the TARGET draft for Subject 1 as a group; keep its members together and do not rewrite the group as one person.",
+        "DUAL": "Edit the TARGET draft as independent changes for Subject 1 and Subject 2; do not introduce a relation that the human did not write.",
+        "RELATIONAL": "Edit the TARGET draft as an explicit directed relationship, preserving exactly who does what to whom between Subject 1 and Subject 2.",
     }[case]
     prompt = (
-        "Assist a human annotator. The first image is QUERY; the second is TARGET. "
-        "The subject identity assignments and case are fixed. Return only a JSON object with "
-        "select_texts (array of English strings) and target_condition (English string). "
-        "For each SELECT text, identify that Subject using visible features in QUERY; "
-        "keep a correct existing description when possible. Do not include 'Identify Subject' in SELECT. "
-        "For TARGET, describe visible evidence in TARGET, explicitly naming Subject 1 "
-        "(and Subject 2 for two-subject cases). Do not invent details or identities. "
-        "Do not include 'then retrieve target images where' in target_condition. "
-        "One SELECT text per Subject in order. No placeholders or explanations. "
+        "You are a LANGUAGE EDITOR for a human-authored RCR annotation, not an annotation generator "
+        "and not a visual verifier. No images are provided. "
+        "The human drafts below are the source of truth for annotation content and semantics. "
+        "They may be terse notes, fragments, Vietnamese, English, or a mixture of both. "
+        "Translate Vietnamese content to ENGLISH, fix grammar and phrasing, and normalize the text to "
+        "the required RCR format. Every returned SELECT and TARGET string MUST be in English. "
+        "Preserve the human's meaning, Subject roles, relation direction, actions, objects, attributes, "
+        "and level of detail. Do not infer, invent, enrich, or add any visual fact that is absent from "
+        "the human draft. Do not silently correct a possible visual mistake because you cannot see the images. "
+        "If an English phrase is already correct and well formatted, keep it as unchanged as possible. "
+        "The case type and Subject assignments are fixed; never reinterpret or change them. "
+        "Return only a JSON object with select_texts (array of English strings) and "
+        "target_condition (English string). "
+        "For each SELECT text, turn the corresponding human QUERY draft into a concise, fluent English "
+        "noun phrase; do not include 'Identify Subject' or labels such as 'Subject 1'/'Subject 2' in SELECT. "
+        "For TARGET, turn the human TARGET draft into fluent English, explicitly naming Subject 1 "
+        "(and Subject 2 for two-subject cases). Do not include 'then retrieve target images where'. "
+        "Keep one SELECT text per Subject in the original order. Do not output placeholders, commentary, "
+        "explanations, or extra keys. "
         f"Case: {case}. {case_rule}\n"
-        f"Subjects/identities: {json.dumps(subjects)}\nSELECT descriptions: {json.dumps(descriptions)}\n"
-        f"QUERY boxes (normalized x,y,w,h): {json.dumps(query_boxes)}\n"
-        f"TARGET boxes (normalized x,y,w,h): {json.dumps(target_boxes)}\n"
-        f"Annotator's previous draft: {previous}\nAnnotator note: {note}"
+        f"Human SELECT drafts to edit/translate: {json.dumps(descriptions, ensure_ascii=False)}\n"
+        f"Human TARGET draft to edit/translate: {previous}\n"
+        f"Optional human clarification (context only; do not use it to replace or expand the drafts): {note}"
     )
-    parts = [{"text": prompt}]
-    for path, title in ((query, "QUERY"), (target, "TARGET")):
-        if path.stat().st_size > 6_000_000:
-            raise InputError(f"{title} image exceeds the 6 MB inline image limit")
-        mime = mimetypes.guess_type(path.name)[0]
-        if mime not in ("image/jpeg", "image/png", "image/webp"):
-            raise InputError("unsupported image MIME type")
-        parts.append(
-            {
-                "inline_data": {
-                    "mime_type": mime,
-                    "data": base64.b64encode(path.read_bytes()).decode(),
-                }
-            }
-        )
     body = json.dumps(
         {
-            "contents": [{"parts": parts}],
+            "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.2,
                 "maxOutputTokens": 4096,
+                "thinkingConfig": ({"thinkingBudget": 1024}
+                                   if model.startswith("gemini-2.5-")
+                                   else {"thinkingLevel": "low"}),
                 "responseMimeType": "application/json",
                 "responseSchema": {
                     "type": "OBJECT",
@@ -315,7 +363,8 @@ def gemini_suggestion(
                     "required": ["select_texts", "target_condition"],
                 },
             },
-        }
+        },
+        ensure_ascii=False,
     ).encode()
     request = urllib.request.Request(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -332,7 +381,7 @@ def gemini_suggestion(
         ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise InputError(
-            "LLM is unavailable; you can still write TARGET manually"
+            "LLM is unavailable; you can still edit the annotation manually"
         ) from exc
     except (ValueError, UnicodeError) as exc:
         raise InputError("Gemini returned invalid JSON; retry or edit manually") from exc
@@ -467,7 +516,7 @@ class Handler(BaseHTTPRequestHandler):
         row = db.execute(
             """
             SELECT s.token_hash, s.csrf, s.expires_at,
-                   u.id, u.username, u.role, u.active
+                   u.id, u.username, u.email, u.role, u.active
             FROM sessions s JOIN users u ON u.id=s.user_id
             WHERE s.token_hash=?
         """,
@@ -484,7 +533,8 @@ class Handler(BaseHTTPRequestHandler):
         if role and user["role"] != role:
             raise Forbidden("this page is not available to your role")
         if write and not hmac.compare_digest(
-            self.headers.get("X-CSRF-Token", ""), session["csrf"]
+            self.headers.get("X-CSRF-Token", "").encode("utf-8"),
+            session["csrf"].encode("utf-8"),
         ):
             raise Forbidden("CSRF token is missing or invalid")
         return user
@@ -524,6 +574,7 @@ class Handler(BaseHTTPRequestHandler):
                         "user": {
                             "id": user["id"],
                             "username": user["username"],
+                            "email": user["email"],
                             "role": user["role"],
                         },
                         "csrf": session["csrf"],
@@ -637,6 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                 "user": {
                     "id": row["id"],
                     "username": row["username"],
+                    "email": row["email"],
                     "role": row["role"],
                 },
                 "csrf": csrf,
@@ -670,7 +722,7 @@ class Handler(BaseHTTPRequestHandler):
     ) -> None:
         if path == "/api/admin/users" and method == "GET":
             rows = db.execute("""
-                SELECT u.id,u.username,u.role,u.active,u.created_at,
+                SELECT u.id,u.username,u.email,u.role,u.active,u.created_at,
                        COALESCE(t.assigned,0) AS assigned,
                        COALESCE(t.pending,0) AS pending,
                        COALESCE(t.in_progress,0) AS in_progress,
@@ -690,6 +742,8 @@ class Handler(BaseHTTPRequestHandler):
                 ) a ON a.author_id=u.id
                 LEFT JOIN (
                     SELECT author_id, COUNT(*) AS ever_completed FROM (
+                        SELECT author_id,task_id FROM task_completions
+                        UNION
                         SELECT a.author_id, a.task_id FROM annotations a
                         JOIN tasks t ON t.sample_id=a.task_id
                         WHERE a.submitted=1 AND t.status='SUBMITTED'
@@ -706,19 +760,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/users/bulk" and method == "POST":
             users = parse_bulk_users(self.body().get("text"))
             # Hashing 200 passwords inside a write transaction blocks all drafts.
-            prepared = [(name, hash_password(password)) for name, password in users]
+            prepared = [
+                (name, email, hash_password(password))
+                for name, email, password in users
+            ]
             db.execute("BEGIN IMMEDIATE")
             try:
-                for username, password_hash in prepared:
+                for username, email, password_hash in prepared:
                     if db.execute(
                         "SELECT 1 FROM users WHERE username=?", (username,)
                     ).fetchone():
                         raise InputError(f"username already exists: {username}")
                     db.execute(
-                        "INSERT INTO users(username,password_hash,role,created_at) "
-                        "VALUES(?,?,?,?)",
+                        "INSERT INTO users(username,email,password_hash,role,created_at) "
+                        "VALUES(?,?,?,?,?)",
                         (
                             username,
+                            email,
                             password_hash,
                             "ANNOTATOR",
                             int(time.time()),
@@ -739,10 +797,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise InputError("username needs 3–40 letters, digits, _, . or -")
             if not isinstance(value.get("password"), str):
                 raise InputError("password is required")
+            email = validate_email(value.get("email"), required=False)
             password = hash_password(value["password"])
             db.execute(
-                "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-                (username, password, "ANNOTATOR", int(time.time())),
+                "INSERT INTO users(username,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
+                (username, email, password, "ANNOTATOR", int(time.time())),
             )
             self.send_json({"ok": True}, 201)
             return
@@ -752,6 +811,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise InputError("user_id must be an integer")
             if "active" in value and not isinstance(value["active"], bool):
                 raise InputError("active must be true or false")
+            email = validate_email(value["email"], required=False) if "email" in value else None
             password_hash = hash_password(value["password"]) if "password" in value else None
             target = db.execute(
                 "SELECT * FROM users WHERE id=?", (value.get("user_id"),)
@@ -762,6 +822,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if password_hash is not None:
                     db.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, target["id"]))
+                if "email" in value:
+                    db.execute("UPDATE users SET email=? WHERE id=?", (email, target["id"]))
+                    db.execute(
+                        "UPDATE annotations SET annotator_email=? WHERE author_id=?",
+                        (email, target["id"]),
+                    )
                 if "active" in value:
                     db.execute("UPDATE users SET active=? WHERE id=?", (int(value["active"]), target["id"]))
                 if password_hash is not None or value.get("active") is False:
@@ -770,7 +836,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 db.rollback()
                 raise
-            self.send_json({"ok": True})
+            self.send_json(
+                {
+                    "ok": True,
+                    "backup_warning": self.record_snapshot()
+                    if "email" in value
+                    else None,
+                }
+            )
             return
         if path == "/api/admin/import" and method == "POST":
             value = self.body()
@@ -824,10 +897,12 @@ class Handler(BaseHTTPRequestHandler):
                         inserted += changed
                         if submitted and changed:
                             db.execute(
-                                """INSERT INTO annotations(task_id,author_id,data_json,submitted,updated_at)
-                                VALUES(?,NULL,?,1,?)""",
+                                """INSERT INTO annotations(
+                                task_id,author_id,annotator_email,data_json,submitted,updated_at)
+                                VALUES(?,NULL,?,?,1,?)""",
                                 (
                                     item["sample_id"],
+                                    item["imported_annotator_email"],
                                     json.dumps(item["imported_annotation"]),
                                     now,
                                 ),
@@ -878,15 +953,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/export" and method == "GET":
             where, params = self.filters(query, export=True)
             rows = db.execute(
-                f"""SELECT t.*,a.data_json FROM tasks t
+                f"""SELECT t.*,a.data_json,
+                    CASE WHEN a.author_id IS NULL THEN a.annotator_email
+                         ELSE u.email END AS annotator_email
+                FROM tasks t
                 JOIN annotations a ON a.task_id=t.sample_id
+                LEFT JOIN users u ON u.id=a.author_id
                 WHERE t.status='SUBMITTED' AND a.submitted=1 AND {where}
                 ORDER BY t.sample_id""",
                 params,
             )
             data = "".join(
                 json.dumps(
-                    export_row(r, json.loads(r["data_json"])), ensure_ascii=False
+                    export_record(r), ensure_ascii=False
                 )
                 + "\n"
                 for r in rows
@@ -944,15 +1023,14 @@ class Handler(BaseHTTPRequestHandler):
         if assignee is not None:
             if type(assignee) is not int:
                 raise InputError("assignee_id must be an integer or null")
-            target = db.execute(
-                "SELECT role,active FROM users WHERE id=?", (assignee,)
-            ).fetchone()
-            if not target or target["role"] != "ANNOTATOR" or not target["active"]:
-                raise InputError("choose an active annotator")
         force = value.get("force") is True
         now = int(time.time())
         db.execute("BEGIN IMMEDIATE")
         try:
+            if assignee is not None:
+                target = db.execute("SELECT role,active FROM users WHERE id=?", (assignee,)).fetchone()
+                if not target or target["role"] != "ANNOTATOR" or not target["active"]:
+                    raise InputError("choose an active annotator")
             tasks = [
                 db.execute("SELECT * FROM tasks WHERE sample_id=?", (sid,)).fetchone()
                 for sid in ids
@@ -979,11 +1057,13 @@ class Handler(BaseHTTPRequestHandler):
                     if existing:
                         db.execute(
                             """INSERT INTO annotation_history(
-                            task_id,author_id,data_json,submitted,archived_at,reason)
-                            VALUES(?,?,?,?,?,?)""",
+                            task_id,author_id,annotator_email,data_json,submitted,
+                            archived_at,reason)
+                            VALUES(?,?,?,?,?,?,?)""",
                             (
                                 sid,
                                 existing["author_id"],
+                                existing["annotator_email"],
                                 existing["data_json"],
                                 existing["submitted"],
                                 now,
@@ -993,7 +1073,7 @@ class Handler(BaseHTTPRequestHandler):
                         db.execute("DELETE FROM annotations WHERE task_id=?", (sid,))
                 db.execute(
                     """UPDATE tasks SET assignee_id=?,status=?,case_type=?,revision=revision+1,
-                    started_at=NULL,submitted_at=NULL,updated_at=? WHERE sample_id=?""",
+                    started_at=NULL,submitted_at=NULL,reopened=0,updated_at=? WHERE sample_id=?""",
                     (
                         assignee,
                         "ASSIGNED" if assignee is not None else "UNASSIGNED",
@@ -1025,7 +1105,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"tasks": [row_task(r) for r in rows]})
             return
         match = re.fullmatch(
-            r"/api/work/tasks/([^/]+)(?:/(draft|submit|suggest))?", path
+            r"/api/work/tasks/([^/]+)(?:/(draft|submit|suggest|reopen))?", path
         )
         if not match:
             raise InputError("unknown task endpoint")
@@ -1049,10 +1129,74 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if method != "POST" or action not in ("draft", "submit", "suggest"):
+        if method != "POST" or action not in ("draft", "submit", "suggest", "reopen"):
             raise InputError("unknown task action")
         body = self.body()
         candidate_ids = json.loads(row["candidates_json"])
+        if action == "reopen":
+            if type(body.get("expected_revision")) is not int:
+                raise InputError("expected_revision is required")
+            now = int(time.time())
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                user = self.require(db, "ANNOTATOR", write=True)
+                fresh = db.execute(
+                    "SELECT * FROM tasks WHERE sample_id=?", (sid,)
+                ).fetchone()
+                previous = db.execute(
+                    "SELECT * FROM annotations WHERE task_id=?", (sid,)
+                ).fetchone()
+                if (
+                    fresh
+                    and fresh["assignee_id"] == user["id"]
+                    and fresh["status"] == "IN_PROGRESS"
+                    and fresh["reopened"]
+                    and fresh["revision"] == body["expected_revision"] + 1
+                    and previous
+                    and not previous["submitted"]
+                ):
+                    # Safe retry after the transition committed but its response was lost.
+                    db.rollback()
+                    result = {
+                        "task": row_task(fresh),
+                        "annotation": json.loads(previous["data_json"]),
+                        "backup_warning": self.record_snapshot(),
+                    }
+                    self.send_json(result)
+                    return
+                if not fresh or fresh["assignee_id"] != user["id"]:
+                    raise Conflict("task was reassigned; reload")
+                if fresh["status"] != "SUBMITTED":
+                    raise Conflict("only a submitted task can be reopened")
+                if fresh["revision"] != body["expected_revision"]:
+                    raise Conflict("task changed in another tab; reload before reopening")
+                if not previous or not previous["submitted"]:
+                    raise Conflict("submitted task has inconsistent annotation state")
+                db.execute(
+                    "UPDATE annotations SET submitted=0,updated_at=? WHERE task_id=?",
+                    (now, sid),
+                )
+                db.execute(
+                    """UPDATE tasks SET status='IN_PROGRESS',submitted_at=NULL,reopened=1,
+                    revision=revision+1,updated_at=? WHERE sample_id=?""",
+                    (now, sid),
+                )
+                saved_task = row_task(
+                    db.execute("SELECT * FROM tasks WHERE sample_id=?", (sid,)).fetchone()
+                )
+                saved_annotation = json.loads(previous["data_json"])
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            self.send_json(
+                {
+                    "task": saved_task,
+                    "annotation": saved_annotation,
+                    "backup_warning": self.record_snapshot(),
+                }
+            )
+            return
         if action == "suggest":
             if row["status"] == "SUBMITTED":
                 raise Conflict("submitted tasks are read-only")
@@ -1063,6 +1207,14 @@ class Handler(BaseHTTPRequestHandler):
             data = normalize_annotation(body.get("annotation"), candidate_ids, False)
             if any(not subject["identity_ids"] for subject in data["subjects"]):
                 raise InputError("select every Subject before asking the LLM")
+            if any(not text.strip() for text in data["select_texts"]):
+                raise InputError(
+                    "write a draft for every SELECT field before using Fix with LLM; Vietnamese notes are allowed"
+                )
+            if not data["target_condition"].strip():
+                raise InputError(
+                    "write a TARGET draft before using Fix with LLM; Vietnamese notes are allowed"
+                )
             if (
                 data["case_type"] == "INDIVIDUAL"
                 and len(data["subjects"][0]["identity_ids"]) != 1
@@ -1088,17 +1240,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 suggestion = gemini_suggestion(
                     self.gemini_model, self.gemini_key,
-                    local_image(self.image_root, row["query_image_path"]),
-                    local_image(self.image_root, row["target_image_path"]),
                     data["case_type"], data["subjects"], data["select_texts"],
                     data["target_condition"], note,
-                    json.loads(row["query_boxes_json"]),
-                    json.loads(row["target_boxes_json"]),
                 )
             finally:
                 with self.llm_lock:
                     self.llm_users.discard(user["id"])
                     self.llm_slots.release()
+            self.require(db, "ANNOTATOR", write=True)
             fresh = db.execute(
                 "SELECT assignee_id,status,revision FROM tasks WHERE sample_id=?",
                 (sid,),
@@ -1120,6 +1269,7 @@ class Handler(BaseHTTPRequestHandler):
         now = int(time.time())
         db.execute("BEGIN IMMEDIATE")
         try:
+            user = self.require(db, "ANNOTATOR", write=True)
             fresh = db.execute(
                 "SELECT * FROM tasks WHERE sample_id=?", (sid,)
             ).fetchone()
@@ -1138,18 +1288,21 @@ class Handler(BaseHTTPRequestHandler):
                     result["backup_warning"] = self.record_snapshot()
                 self.send_json(result)
                 return
-            if fresh["assignee_id"] != user["id"] or fresh["status"] == "SUBMITTED":
+            if not fresh or fresh["assignee_id"] != user["id"] or fresh["status"] == "SUBMITTED":
                 raise Conflict("task was reassigned or already submitted; reload")
             if fresh["revision"] != body["expected_revision"]:
                 raise Conflict("task changed in another tab; reload before saving")
             db.execute(
-                """INSERT INTO annotations(task_id,author_id,data_json,submitted,updated_at)
-                VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
-                author_id=excluded.author_id,data_json=excluded.data_json,
-                submitted=excluded.submitted,updated_at=excluded.updated_at""",
+                """INSERT INTO annotations(
+                task_id,author_id,annotator_email,data_json,submitted,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+                author_id=excluded.author_id,annotator_email=excluded.annotator_email,
+                data_json=excluded.data_json,submitted=excluded.submitted,
+                updated_at=excluded.updated_at""",
                 (
                     sid,
                     user["id"],
+                    user["email"],
                     json.dumps(data, ensure_ascii=False),
                     int(action == "submit"),
                     now,
@@ -1168,6 +1321,10 @@ class Handler(BaseHTTPRequestHandler):
                     sid,
                 ),
             )
+            if action == "submit":
+                db.execute("UPDATE tasks SET reopened=0 WHERE sample_id=?", (sid,))
+                db.execute("INSERT OR IGNORE INTO task_completions(task_id,author_id) VALUES(?,?)",
+                           (sid, user["id"]))
             saved_task = row_task(db.execute("SELECT * FROM tasks WHERE sample_id=?", (sid,)).fetchone())
             db.commit()
         except Exception:
@@ -1210,9 +1367,25 @@ def main() -> None:
                 integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
                 foreign_keys = db.execute("PRAGMA foreign_key_check").fetchall()
                 counts = dict(db.execute("SELECT status,COUNT(*) FROM tasks GROUP BY status"))
+                state_errors = db.execute("""
+                    SELECT COUNT(*) FROM tasks t
+                    LEFT JOIN annotations a ON a.task_id=t.sample_id
+                    WHERE (t.status='SUBMITTED' AND
+                           (a.task_id IS NULL OR a.submitted!=1 OR t.submitted_at IS NULL))
+                       OR (t.status='IN_PROGRESS' AND
+                           (a.task_id IS NULL OR a.submitted!=0 OR t.submitted_at IS NOT NULL))
+                       OR (t.status='ASSIGNED' AND
+                           (t.assignee_id IS NULL OR a.task_id IS NOT NULL
+                            OR t.submitted_at IS NOT NULL))
+                       OR (t.status='UNASSIGNED' AND
+                           (t.assignee_id IS NOT NULL OR a.task_id IS NOT NULL
+                            OR t.submitted_at IS NOT NULL))
+                """).fetchone()[0]
                 print(json.dumps({"database": str(args.db), "integrity": integrity,
-                                  "foreign_key_errors": len(foreign_keys), "tasks": counts}, indent=2))
-                if integrity != "ok" or foreign_keys:
+                                  "foreign_key_errors": len(foreign_keys),
+                                  "state_invariant_errors": state_errors,
+                                  "tasks": counts}, indent=2))
+                if integrity != "ok" or foreign_keys or state_errors:
                     raise SystemExit(1)
         return
     init_database(args.db)
@@ -1241,7 +1414,7 @@ def main() -> None:
     if image_root is not None and not image_root.is_dir():
         parser.error("RCR_IMAGE_ROOT must point to an existing image directory")
     if image_root is None:
-        LOG.warning("RCR_IMAGE_ROOT is not set; images and Gemini will be unavailable")
+        LOG.warning("RCR_IMAGE_ROOT is not set; task images will be unavailable")
     handler = type(
         "ConfiguredHandler",
         (Handler,),

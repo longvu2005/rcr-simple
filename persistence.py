@@ -13,6 +13,27 @@ from pathlib import Path
 _snapshot_lock = threading.Lock()
 
 
+def export_record(row: sqlite3.Row) -> dict:
+    """Build the one canonical public record for a submitted annotation."""
+    annotation = json.loads(row["data_json"])
+    return {
+        "sample_id": row["sample_id"],
+        "split": row["split"],
+        "annotator_email": row["annotator_email"],
+        "query_image_id": row["query_image_id"],
+        "query_image_path": row["query_image_path"],
+        "query_boxes": json.loads(row["query_boxes_json"]),
+        "target_image_id": row["target_image_id"],
+        "target_image_path": row["target_image_path"],
+        "target_boxes": json.loads(row["target_boxes_json"]),
+        "case_type": annotation["case_type"],
+        "subjects": annotation["subjects"],
+        "final_desc": annotation["final_desc"],
+        "final_change": annotation["final_change"],
+        "final_instruction": annotation["final_instruction"],
+    }
+
+
 def backup_database(db_path: Path, destination: Path) -> Path:
     """Consistent full backup, including committed WAL data while the server runs."""
     db_path = db_path.resolve(strict=True)
@@ -56,26 +77,20 @@ def write_snapshot(db_path: Path, destination: Path | None = None) -> Path:
                     db.row_factory = sqlite3.Row
                     db.execute("BEGIN")
                     for row in db.execute("""
-                        SELECT t.sample_id,t.query_image_id,t.target_image_ids_json,
-                               a.data_json FROM tasks t JOIN annotations a
-                               ON a.task_id=t.sample_id
+                        SELECT t.sample_id,t.split,
+                               CASE WHEN a.author_id IS NULL THEN a.annotator_email
+                                    ELSE u.email END AS annotator_email,
+                               t.query_image_id,t.query_image_path,t.query_boxes_json,
+                               t.target_image_id,t.target_image_path,t.target_boxes_json,
+                               a.data_json
+                        FROM tasks t JOIN annotations a ON a.task_id=t.sample_id
+                        LEFT JOIN users u ON u.id=a.author_id
                         WHERE t.status='SUBMITTED' AND a.submitted=1
                         ORDER BY t.sample_id
                     """):
-                        annotation = json.loads(row["data_json"])
-                        result = {
-                            "sample_id": row["sample_id"],
-                            "case_type": annotation["case_type"],
-                            "query_image_id": row["query_image_id"],
-                            "target_image_ids": json.loads(
-                                row["target_image_ids_json"]
-                            ),
-                            "subjects": annotation["subjects"],
-                            "final_desc": annotation["final_desc"],
-                            "final_change": annotation["final_change"],
-                            "final_instruction": annotation["final_instruction"],
-                        }
-                        output.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        output.write(
+                            json.dumps(export_record(row), ensure_ascii=False) + "\n"
+                        )
                     db.rollback()
                 output.flush()
                 os.fsync(output.fileno())

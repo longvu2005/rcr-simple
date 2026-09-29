@@ -14,7 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from core import InputError, normalize_annotation, normalize_task, target_body
+from core import InputError, normalize_annotation, normalize_task, target_body, validate_email
 
 
 def relative_image(url: str) -> str:
@@ -115,6 +115,9 @@ def build_rows(
                         annotation, normalized["candidate_identity_ids"], True
                     )
                     row["imported_annotation"] = annotation
+                    email = validate_email(sample.get("annotator_email"))
+                    if email is not None:
+                        row["annotator_email"] = email
                 output.append(row)
             except (InputError, KeyError) as exc:
                 skipped[str(exc)] += 1
@@ -145,10 +148,10 @@ def main() -> None:
     args = parser.parse_args()
     if not args.samples and not args.all_pairs:
         parser.error("provide --samples, --all-pairs, or both")
-    pair_data = json.loads(args.pair_data.read_text(encoding="utf-8"))
+    pair_data = json.loads(args.pair_data.read_text(encoding="utf-8-sig"))
     samples = []
     if args.samples:
-        with args.samples.open(encoding="utf-8") as source:
+        with args.samples.open(encoding="utf-8-sig") as source:
             samples = [json.loads(line) for line in source if line.strip()]
     rows, skipped = build_rows(pair_data, samples, args.all_pairs, args.existing_mode)
     if not rows:

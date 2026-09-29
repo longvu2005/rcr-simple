@@ -53,51 +53,67 @@
         </div>
         <div id="adminUsers" hidden>
           <div class="page-head"><div><h1>Annotators</h1><p>Tạo tài khoản, theo dõi tiến độ, đặt lại mật khẩu hoặc khóa người dùng.</p></div></div>
-          <section class="panel"><h2>Thêm annotator</h2><form id="createUser" class="user-form"><input name="username" placeholder="Tên đăng nhập" required><input name="password" placeholder="Mật khẩu ≥ 4 ký tự" type="password" minlength="4" required><button class="primary">Tạo user</button></form></section>
-          <section class="panel"><h2>Thêm nhiều annotator</h2><p>Mỗi dòng: <code>username,password</code>. Mật khẩu tối thiểu 4 ký tự; nếu có dấu phẩy, đặt mật khẩu trong dấu ngoặc kép. Tối đa 200 user/lần. Có lỗi thì không tạo tài khoản nào.</p><form id="createUsersBulk" class="bulk-user-form"><textarea id="bulkUsersText" placeholder="annotator01,mat_khau_dai_01&#10;annotator02,mat_khau_dai_02" rows="5" spellcheck="false" required></textarea><button class="primary">Tạo tất cả</button></form></section>
-          <section class="panel"><h2>Thống kê theo annotator</h2><p>“Đã nộp hiện tại” chỉ tính kết quả cuối còn hiệu lực. “Đã từng hoàn thành” tính mỗi task một lần, gồm cả bản đã lưu vào lịch sử khi giao lại. Task import cũ không có người làm không tính cho ai.</p><div class="table-scroll"><table><thead><tr><th>User</th><th>Vai trò</th><th>Đã giao</th><th>Chưa bắt đầu</th><th>Đang làm</th><th>Đã nộp hiện tại</th><th>Đã từng hoàn thành</th><th>Tiến độ</th><th>Trạng thái</th><th>Thao tác</th></tr></thead><tbody id="userRows"></tbody></table></div></section>
+          <section class="panel"><h2>Thêm annotator</h2><form id="createUser" class="user-form" autocomplete="off"><input name="username" placeholder="Tên đăng nhập" autocomplete="off" value="" required><input name="email" placeholder="Email annotator" type="email" autocomplete="off" value="" required><input name="password" placeholder="Mật khẩu ≥ 4 ký tự" type="password" minlength="4" autocomplete="new-password" value="" required><button class="primary">Tạo user</button></form></section>
+          <section class="panel"><h2>Thêm nhiều annotator</h2><p>Mỗi dòng mới: <code>username,email,password</code>. Dạng cũ <code>username,password</code> vẫn được chấp nhận và để trống email; admin có thể bổ sung sau. Nếu mật khẩu có dấu phẩy, đặt trong dấu ngoặc kép. Tối đa 200 user/lần; có lỗi thì không tạo tài khoản nào.</p><form id="createUsersBulk" class="bulk-user-form"><textarea id="bulkUsersText" placeholder="annotator01,user01@example.com,mat_khau_dai_01&#10;annotator02,user02@example.com,mat_khau_dai_02" rows="5" spellcheck="false" required></textarea><button class="primary">Tạo tất cả</button></form></section>
+          <section class="panel"><h2>Thống kê theo annotator</h2><p>“Đã nộp hiện tại” chỉ tính kết quả cuối còn hiệu lực. “Đã từng hoàn thành” tính mỗi task một lần, gồm cả bản đã lưu vào lịch sử khi giao lại. Task import cũ không có người làm không tính cho ai.</p><div class="table-scroll"><table><thead><tr><th>User</th><th>Email</th><th>Vai trò</th><th>Đã giao</th><th>Chưa bắt đầu</th><th>Đang làm</th><th>Đã nộp hiện tại</th><th>Đã từng hoàn thành</th><th>Tiến độ</th><th>Trạng thái</th><th>Thao tác</th></tr></thead><tbody id="userRows"></tbody></table></div></section>
         </div>
         <div id="adminMessage" class="toast" role="status" hidden></div>
       </main>
     </div>
 
     <div id="work" class="work-layout" hidden>
-      <aside class="queue">
+      <aside id="workQueue" class="queue" aria-label="Hàng đợi của tôi">
+        <button id="toggleQueue" class="queue-toggle" type="button" aria-controls="queueContent" aria-expanded="true" title="Thu gọn hàng đợi">‹</button>
+        <div id="queueContent" class="queue-content">
         <div class="queue-top"><div class="queue-title"><h2>Hàng đợi của tôi</h2><button id="refreshQueue" title="Tải lại task được giao">↻</button></div><p id="progressText">0 / 0 đã nộp</p><div class="progress"><div id="progressFill"></div></div></div>
         <div class="queue-filters"><div class="status-tabs"><button data-work-status="all">Tất cả</button><button data-work-status="pending" class="active">Chưa xong</button><button data-work-status="completed">Đã nộp</button></div><input id="workSearch" placeholder="Tìm sample_id"><select id="workCase"><option value="">Mọi case</option><option>INDIVIDUAL</option><option>GROUP</option><option>DUAL</option><option>RELATIONAL</option></select></div>
         <div id="queueList" class="queue-list"></div>
+        </div>
       </aside>
       <main class="workspace">
         <div class="work-top"><button id="prevTask">← Trước</button><button id="nextTask">Tiếp →</button><strong id="workTitle">Chọn task</strong><span id="workStatus" class="pill"></span><span class="spacer"></span><code id="workId"></code></div>
         <div id="emptyWork" class="empty-work">Chọn một task trong hàng đợi để bắt đầu.</div>
         <div id="taskEditor" class="editor" hidden>
-          <section id="draftRecovery" class="panel" hidden>
+          <section id="draftRecovery" class="panel recovery-panel" hidden>
             <h2>Có bản nháp chưa được xác nhận lưu</h2>
             <p>Nội dung bên dưới là bản trên server. Bạn có thể tải bản nháp dự phòng để đối chiếu, khôi phục để sửa tiếp, hoặc giữ bản trên server. Task đã nộp chỉ cho phép tải bản nháp.</p>
             <button id="downloadLocal">Tải bản nháp dự phòng</button>
             <button id="restoreLocal">Khôi phục để sửa tiếp</button>
             <button id="discardLocal">Giữ bản trên server</button>
           </section>
-          <section class="panel"><div class="section-title"><span>01 / CASE</span><small>INDIVIDUAL ↔ GROUP tự đổi theo số identity của S1</small></div><div class="case-options"><button id="oneCase" data-case-mode="one">INDIVIDUAL</button><button data-case-mode="DUAL">DUAL</button><button data-case-mode="RELATIONAL">RELATIONAL</button></div><p id="caseHint" class="case-hint"></p></section>
-          <section class="panel"><div class="section-title"><span>02 / SUBJECT ASSIGNMENT</span><small>Chọn S1 hoặc S2, rồi bấm box người. Identity đồng bộ trên hai ảnh.</small></div>
+          <div class="annotation-grid">
+          <div class="visual-column">
+          <section class="panel visual-panel" aria-label="Query và Target">
             <div class="images">
               <div class="image-card"><div class="image-head"><strong>QUERY</strong><button data-zoom="query" data-delta="-1">−</button><span id="queryZoom">100%</span><button data-zoom="query" data-delta="1">+</button><button data-reset="query">Reset</button></div><div id="queryViewport" class="viewport"><div id="queryStage" class="stage"><img id="queryImage" alt="Query image"><div id="queryBoxes"></div></div></div><div id="queryError" class="image-error" hidden>Không tải được ảnh QUERY. Kiểm tra RCR_IMAGE_ROOT.</div></div>
               <div class="image-card"><div class="image-head"><strong>TARGET</strong><button data-zoom="target" data-delta="-1">−</button><span id="targetZoom">100%</span><button data-zoom="target" data-delta="1">+</button><button data-reset="target">Reset</button></div><div id="targetViewport" class="viewport"><div id="targetStage" class="stage"><img id="targetImage" alt="Target image"><div id="targetBoxes"></div></div></div><div id="targetError" class="image-error" hidden>Không tải được ảnh TARGET. Kiểm tra RCR_IMAGE_ROOT.</div></div>
             </div>
-            <div class="subject-foot"><strong>Active Subject</strong><button id="subject1" class="subject s1">S1</button><button id="subject2" class="subject s2">S2</button><span id="subjectCounts"></span></div>
           </section>
-          <section class="panel"><div class="section-title"><span>03 / SELECT</span><small>Mô tả người/nhóm trong QUERY; không gõ “Identify Subject …”.</small></div>
+          <section class="panel assignment-panel">
+            <div class="compact-row"><h2>Case</h2><div class="case-options"><button id="oneCase" data-case-mode="one">INDIVIDUAL</button><button data-case-mode="DUAL">DUAL</button><button data-case-mode="RELATIONAL">RELATIONAL</button></div></div>
+            <p id="caseHint" class="case-hint"></p>
+            <div class="assignment-row"><h2>Assign identities</h2><button id="subject1" class="subject s1">Subject 1</button><button id="subject2" class="subject s2">Subject 2</button><span id="subjectCounts"></span></div>
+            <p class="assignment-tip">Chọn Subject rồi bấm box trên QUERY hoặc TARGET; identity được đồng bộ trên hai ảnh.</p>
+          </section>
+          </div>
+          <div class="annotation-column">
+          <section class="panel form-panel"><h2>Annotation</h2>
             <label for="select1">Subject 1 · Identify as</label><textarea id="select1" rows="2" placeholder="the man in a dark suit standing on the left"></textarea>
             <div id="select2Group" hidden><label for="select2">Subject 2 · Identify as</label><textarea id="select2" rows="2" placeholder="the woman in a white dress"></textarea></div>
+            <label for="targetText">Target condition</label><textarea id="targetText" rows="3" placeholder="Subject 1 is holding a diploma and Subject 2 is clapping"></textarea>
+            <small class="field-help">Viết ý chính bằng tiếng Việt hoặc tiếng Anh. Target cần nhắc đến Subject 1 và Subject 2 nếu có.</small>
           </section>
-          <section class="panel"><div class="section-title"><span>04 / TARGET CONDITION</span><small>Mọi case chỉ dùng một ô; nêu rõ S1/S2 và quan hệ có hướng nếu là RELATIONAL.</small></div>
-            <div class="target-head"><label for="targetText">then retrieve target images where …</label><button id="suggestBtn">✦ Fix with LLM</button></div>
-            <textarea id="targetText" rows="4" placeholder="Subject 1 is holding a diploma and Subject 2 is clapping"></textarea>
-            <details class="note"><summary>Thêm ghi chú cho LLM (tùy chọn)</summary><input id="llmNote" maxlength="500" placeholder="Ví dụ: S1 trao bằng cho S2"></details>
-            <div id="suggestion" class="suggestion" hidden><div><strong>Đề xuất của LLM · SELECT + TARGET</strong><span>Hãy đối chiếu hai ảnh trước khi dùng.</span></div><p id="suggestionText"></p><button id="useSuggestion">Áp dụng và lưu nháp</button></div>
+          <section class="panel llm-panel"><h2>Fix annotation with LLM</h2>
+            <label for="llmNote">Ghi chú cho LLM <span class="muted">(tùy chọn)</span></label>
+            <input id="llmNote" maxlength="500" placeholder="Ví dụ: S1 trao bằng cho S2, không phải bắt tay">
+            <button id="suggestBtn" type="button">✦ Fix with LLM</button>
+            <small class="field-help">LLM chỉ đọc phần chữ bạn viết; hãy đối chiếu lại hai ảnh.</small>
           </section>
-          <section class="panel preview-panel"><div class="section-title"><span>05 / FINAL INSTRUCTION</span><small>Tạo tự động · chỉ đọc</small></div><p id="previewText" class="preview-text">Điền SELECT và TARGET để xem câu hoàn chỉnh.</p></section>
-          <div class="work-actions"><span id="saveState" class="muted" role="status"></span><span class="spacer"></span><span id="workError" class="error" role="alert"></span><button id="downloadDraft">Tải nháp</button><button id="reloadTask">Tải lại task</button><button id="saveDraft">Lưu nháp</button><button id="submitTask" class="primary">Nộp &amp; task tiếp theo</button></div>
+          <section id="suggestion" class="panel suggestion" hidden><h2>LLM Suggestions</h2><div id="suggestionFields"></div></section>
+          <section class="panel preview-panel"><div class="preview-heading"><h2>Final instruction</h2><small>Tự cập nhật · chỉ đọc</small></div><p id="previewText" class="preview-text">Điền annotation để xem câu hoàn chỉnh.</p></section>
+          <div class="work-actions"><div class="work-feedback"><span id="saveState" class="muted" role="status"></span><span id="workError" class="error" role="alert"></span></div><div class="action-buttons"><details class="more-actions"><summary title="Thao tác khác" aria-label="Thao tác khác">⋯</summary><div class="more-menu"><button id="downloadDraft" type="button">Tải nháp</button><button id="reloadTask" type="button">Tải lại task</button></div></details><button id="reopenTask" class="primary" type="button" hidden>Sửa lại</button><button id="saveDraft">Lưu nháp</button><button id="submitTask" class="primary">Nộp &amp; task tiếp theo</button></div></div>
+          </div>
+          </div>
         </div>
       </main>
     </div>

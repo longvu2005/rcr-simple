@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -19,7 +20,14 @@ from unittest.mock import patch
 
 from core import InputError, normalize_annotation, normalize_task, parse_json_tasks
 from persistence import backup_database, snapshot_path, write_snapshot
-from server import Handler, connect, gemini_suggestion, hash_password, init_database
+from server import (
+    Handler,
+    connect,
+    gemini_suggestion,
+    hash_password,
+    init_database,
+    validate_email,
+)
 
 ONE_PIXEL_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg=="
@@ -63,6 +71,38 @@ def annotation(
 
 
 class ValidationTests(unittest.TestCase):
+    def test_email_validation_and_additive_database_migration(self):
+        self.assertEqual(validate_email(" Person@Example.COM "), "Person@example.com")
+        for value in ("not-an-email", "a..b@example.com", "a@-example.com"):
+            with self.assertRaises(InputError):
+                validate_email(value, required=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old.sqlite3"
+            with sqlite3.connect(path) as db:
+                db.executescript("""
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                        password_hash TEXT NOT NULL, role TEXT NOT NULL,
+                        active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE annotations (
+                        task_id TEXT PRIMARY KEY, author_id INTEGER,
+                        data_json TEXT NOT NULL, submitted INTEGER NOT NULL DEFAULT 0,
+                        updated_at INTEGER NOT NULL
+                    );
+                """)
+            init_database(path)
+            with connect(path) as db:
+                self.assertIn("email", {r["name"] for r in db.execute("PRAGMA table_info(users)")})
+                self.assertIn(
+                    "annotator_email",
+                    {r["name"] for r in db.execute("PRAGMA table_info(annotations)")},
+                )
+                self.assertIn(
+                    "annotator_email",
+                    {r["name"] for r in db.execute("PRAGMA table_info(annotation_history)")},
+                )
+
     def test_import_canonical_text_bom_and_line_numbers(self):
         row = sample("canonical")
         final = normalize_annotation(annotation("INDIVIDUAL", ["1"]), ["1", "2"], True)
@@ -134,140 +174,135 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(InputError):
             normalize_task(row)
 
-    def test_llm_request_contains_two_images_and_returns_only_suggestion(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "image.png"
-            path.write_bytes(ONE_PIXEL_PNG)
-            fake = {
-                "candidates": [
-                    {
-                        "content": {
-                            "parts": [
-                                {"text": "internal reasoning", "thought": True},
-                                {
-                                    "text": json.dumps(
-                                        {
-                                            "select_texts": ["the man", "the woman"],
-                                            "target_condition": "Subject 1 is presenting a diploma to Subject 2",
-                                        }
-                                    )
-                                },
-                            ]
-                        }
+    def test_llm_request_is_text_only_low_thinking_and_returns_only_suggestion(self):
+        fake = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "internal reasoning", "thought": True},
+                            {
+                                "text": json.dumps(
+                                    {
+                                        "select_texts": ["the man", "the woman"],
+                                        "target_condition": "Subject 1 is presenting a diploma to Subject 2",
+                                    }
+                                )
+                            },
+                        ]
                     }
-                ]
-            }
-            with patch(
-                "urllib.request.urlopen",
-                return_value=io.BytesIO(json.dumps(fake).encode()),
-            ) as call:
-                suggestion = gemini_suggestion(
-                    "configured-model",
-                    "test-key",
-                    path,
-                    path,
-                    "RELATIONAL",
-                    [
-                        {"subject_id": 1, "identity_ids": ["1"]},
-                        {"subject_id": 2, "identity_ids": ["2"]},
-                    ],
-                    ["the man", "the woman"],
-                    "",
-                    "",
-                    [],
-                    [],
-                )
-            request = call.call_args.args[0]
-            payload = json.loads(request.data)
-            parts = payload["contents"][0]["parts"]
-            self.assertEqual(sum("inline_data" in p for p in parts), 2)
-            self.assertEqual(
-                payload["generationConfig"]["responseMimeType"], "application/json"
+                }
+            ]
+        }
+        with patch(
+            "urllib.request.urlopen",
+            return_value=io.BytesIO(json.dumps(fake).encode()),
+        ) as call:
+            suggestion = gemini_suggestion(
+                "configured-model",
+                "test-key",
+                "RELATIONAL",
+                [
+                    {"subject_id": 1, "identity_ids": ["1"]},
+                    {"subject_id": 2, "identity_ids": ["2"]},
+                ],
+                ["người đàn ông", "người phụ nữ"],
+                "S1 đang trao bằng cho S2",
+                "giữ đúng hướng S1 sang S2",
             )
-            self.assertEqual(
-                payload["generationConfig"]["responseSchema"]["required"],
-                ["select_texts", "target_condition"],
-            )
-            self.assertGreaterEqual(
-                payload["generationConfig"]["maxOutputTokens"], 4096
-            )
-            self.assertEqual(
-                suggestion["target_condition"],
-                "Subject 1 is presenting a diploma to Subject 2",
-            )
-            self.assertEqual(suggestion["select_texts"], ["the man", "the woman"])
+        request = call.call_args.args[0]
+        payload = json.loads(request.data)
+        parts = payload["contents"][0]["parts"]
+        prompt = parts[0]["text"]
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(set(parts[0]), {"text"})
+        self.assertNotIn("inline_data", json.dumps(payload))
+        self.assertIn("LANGUAGE EDITOR", prompt)
+        self.assertIn("not a visual verifier", prompt)
+        self.assertIn("No images are provided", prompt)
+        self.assertIn("Translate Vietnamese content to ENGLISH", prompt)
+        self.assertIn("source of truth", prompt)
+        self.assertIn("Do not infer, invent, enrich, or add any visual fact", prompt)
+        self.assertNotIn("QUERY boxes", prompt)
+        self.assertNotIn("TARGET boxes", prompt)
+        self.assertNotIn("Subjects/identities", prompt)
+        self.assertEqual(
+            payload["generationConfig"]["thinkingConfig"],
+            {"thinkingLevel": "low"},
+        )
+        self.assertEqual(
+            payload["generationConfig"]["responseMimeType"], "application/json"
+        )
+        self.assertEqual(
+            payload["generationConfig"]["responseSchema"]["required"],
+            ["select_texts", "target_condition"],
+        )
+        self.assertGreaterEqual(
+            payload["generationConfig"]["maxOutputTokens"], 4096
+        )
+        self.assertEqual(
+            suggestion["target_condition"],
+            "Subject 1 is presenting a diploma to Subject 2",
+        )
+        self.assertEqual(suggestion["select_texts"], ["the man", "the woman"])
 
     def test_gemini_truncated_response_and_missing_fields_are_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "image.png"
-            path.write_bytes(ONE_PIXEL_PNG)
-            cases = [
-                ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "truncated"),
-                ({"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}, "invalid"),
-            ]
-            for response, message in cases:
-                with (
-                    self.subTest(message=message),
-                    patch(
-                        "urllib.request.urlopen",
-                        return_value=io.BytesIO(json.dumps(response).encode()),
-                    ),
-                ):
-                    with self.assertRaisesRegex(InputError, message):
-                        gemini_suggestion(
-                            "model",
-                            "key",
-                            path,
-                            path,
-                            "INDIVIDUAL",
-                            [{"subject_id": 1, "identity_ids": ["1"]}],
-                            [""],
-                            "",
-                            "",
-                            [],
-                            [],
-                        )
-
-    def test_llm_cannot_change_subject_contract(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "image.png"
-            path.write_bytes(ONE_PIXEL_PNG)
-            fake = {
-                "candidates": [
-                    {
-                        "content": {
-                            "parts": [
-                                {
-                                    "text": json.dumps(
-                                        {
-                                            "select_texts": ["the man"],
-                                            "target_condition": "A different person is seated",
-                                        }
-                                    )
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }
-            with patch(
-                "urllib.request.urlopen",
-                return_value=io.BytesIO(json.dumps(fake).encode()),
+        cases = [
+            ({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "truncated"),
+            ({"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}, "invalid"),
+        ]
+        for response, message in cases:
+            with (
+                self.subTest(message=message),
+                patch(
+                    "urllib.request.urlopen",
+                    return_value=io.BytesIO(json.dumps(response).encode()),
+                ),
             ):
-                with self.assertRaisesRegex(InputError, "LLM output is invalid"):
+                with self.assertRaisesRegex(InputError, message):
                     gemini_suggestion(
                         "model",
                         "key",
-                        path,
-                        path,
                         "INDIVIDUAL",
                         [{"subject_id": 1, "identity_ids": ["1"]}],
-                        [""],
+                        ["người đàn ông"],
+                        "S1 đang ngồi",
                         "",
-                        "",
-                        [],
-                        [],
                     )
+
+    def test_llm_cannot_change_subject_contract(self):
+        fake = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": json.dumps(
+                                    {
+                                        "select_texts": ["the man"],
+                                        "target_condition": "A different person is seated",
+                                    }
+                                )
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        with patch(
+            "urllib.request.urlopen",
+            return_value=io.BytesIO(json.dumps(fake).encode()),
+        ):
+            with self.assertRaisesRegex(InputError, "LLM output is invalid"):
+                gemini_suggestion(
+                    "model",
+                    "key",
+                    "INDIVIDUAL",
+                    [{"subject_id": 1, "identity_ids": ["1"]}],
+                    ["người đàn ông"],
+                    "S1 đang ngồi",
+                    "",
+                )
 
 
 class ServerTests(unittest.TestCase):
@@ -380,11 +415,16 @@ class ServerTests(unittest.TestCase):
             self.admin,
             endpoint,
             {
-                "text": 'workerA,"strong,password 1"\nworkerB,strong password 2\n',
+                "text": 'workerA,WorkerA@Example.COM,"strong,password 1"\nworkerB,strong password 2\n',
             },
             self.admin_csrf,
         )
         self.assertEqual((status, result["created"]), (201, 2))
+        _, listed = self.request(self.admin, "/api/admin/users")
+        self.assertEqual(
+            next(u for u in listed["users"] if u["username"] == "workerA")["email"],
+            "WorkerA@example.com",
+        )
         self.login(self.worker, "workerA", "strong,password 1")
         status, _ = self.request(
             self.admin,
@@ -521,7 +561,7 @@ class ServerTests(unittest.TestCase):
 
     def test_full_flow_ownership_revision_export_and_history(self):
         for path, marker in (
-            ("/", b"TARGET CONDITION"),
+            ("/", b"Target condition"),
             ("/app.js", b"function renderWork"),
             ("/style.css", b".work-layout"),
         ):
@@ -551,7 +591,11 @@ class ServerTests(unittest.TestCase):
         status, _ = self.request(
             self.admin,
             "/api/admin/users",
-            {"username": "worker1", "password": "strong worker pass"},
+            {
+                "username": "worker1",
+                "email": "worker1@example.com",
+                "password": "strong worker pass",
+            },
             self.admin_csrf,
         )
         self.assertEqual(status, 201)
@@ -625,7 +669,20 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         row = json.loads(content.decode().splitlines()[0])
         self.assertEqual(snapshot_path(self.db).read_bytes(), content)
-        self.assertEqual(row["target_image_ids"], ["t", "t2"])
+        self.assertEqual(
+            list(row),
+            [
+                "sample_id", "split", "annotator_email", "query_image_id",
+                "query_image_path", "query_boxes", "target_image_id",
+                "target_image_path", "target_boxes", "case_type", "subjects",
+                "final_desc", "final_change", "final_instruction",
+            ],
+        )
+        self.assertEqual(row["annotator_email"], "worker1@example.com")
+        self.assertEqual(row["target_image_id"], "t")
+        self.assertNotIn("target_image_ids", row)
+        self.assertIsInstance(row["query_boxes"], list)
+        self.assertIsInstance(row["target_boxes"], list)
         self.assertEqual(
             row["final_instruction"],
             row["final_desc"] + "; " + row["final_change"] + ".",
@@ -648,7 +705,159 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM annotation_history").fetchone()[0], 1
             )
+            self.assertEqual(
+                db.execute(
+                    "SELECT annotator_email FROM annotation_history WHERE task_id='x'"
+                ).fetchone()[0],
+                "worker1@example.com",
+            )
         self.assertEqual(snapshot_path(self.db).read_text(), "")
+
+    def test_reopen_submit_cycle_is_atomic_and_keeps_one_current_annotation(self):
+        uid = self.prepare_worker(["redo"])
+        _, fetched = self.request(self.worker, "/api/work/tasks/redo")
+        first = annotation("INDIVIDUAL", ["1"])
+        status, submitted = self.request(
+            self.worker,
+            "/api/work/tasks/redo/submit",
+            {"expected_revision": fetched["task"]["revision"], "annotation": first},
+            self.worker_csrf,
+        )
+        self.assertEqual((status, submitted["task"]["status"]), (200, "SUBMITTED"))
+        submitted_revision = submitted["task"]["revision"]
+        self.assertEqual(len(snapshot_path(self.db).read_text().splitlines()), 1)
+
+        status, _ = self.request(
+            self.worker,
+            "/api/work/tasks/redo/reopen",
+            {"expected_revision": submitted_revision - 1},
+            self.worker_csrf,
+        )
+        self.assertEqual(status, 409)
+        self.request(
+            self.admin,
+            "/api/admin/users",
+            {"username": "other", "email": "other@example.com", "password": "password"},
+            self.admin_csrf,
+        )
+        other_csrf = self.login(self.stranger, "other", "password")
+        status, _ = self.request(
+            self.stranger,
+            "/api/work/tasks/redo/reopen",
+            {"expected_revision": submitted_revision},
+            other_csrf,
+        )
+        self.assertEqual(status, 403)
+
+        reopen_payload = {"expected_revision": submitted_revision}
+        status, reopened = self.request(
+            self.worker, "/api/work/tasks/redo/reopen", reopen_payload, self.worker_csrf
+        )
+        self.assertEqual((status, reopened["task"]["status"]), (200, "IN_PROGRESS"))
+        self.assertIsNone(reopened["task"]["submitted_at"])
+        self.assertEqual(reopened["annotation"]["final_instruction"], submitted["annotation"]["final_instruction"])
+        self.assertEqual(snapshot_path(self.db).read_text(), "")
+        status, retry = self.request(
+            self.worker, "/api/work/tasks/redo/reopen", reopen_payload, self.worker_csrf
+        )
+        self.assertEqual((status, retry["task"]["revision"]), (200, reopened["task"]["revision"]))
+
+        changed = annotation("INDIVIDUAL", ["1"], target="Subject 1 is standing")
+        changed["select_texts"] = ["the person wearing a black jacket"]
+        status, draft = self.request(
+            self.worker,
+            "/api/work/tasks/redo/draft",
+            {"expected_revision": reopened["task"]["revision"], "annotation": changed},
+            self.worker_csrf,
+        )
+        self.assertEqual((status, draft["task"]["status"]), (200, "IN_PROGRESS"))
+        status, resubmitted = self.request(
+            self.worker,
+            "/api/work/tasks/redo/submit",
+            {"expected_revision": draft["task"]["revision"], "annotation": changed},
+            self.worker_csrf,
+        )
+        self.assertEqual((status, resubmitted["task"]["status"]), (200, "SUBMITTED"))
+        with connect(self.db) as db:
+            task = db.execute("SELECT * FROM tasks WHERE sample_id='redo'").fetchone()
+            current = db.execute("SELECT * FROM annotations WHERE task_id='redo'").fetchone()
+            self.assertEqual((task["status"], current["submitted"]), ("SUBMITTED", 1))
+            self.assertIsNotNone(task["submitted_at"])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM annotations WHERE task_id='redo'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM annotation_history WHERE task_id='redo'").fetchone()[0], 0)
+            self.assertEqual(current["author_id"], uid)
+        final_row = json.loads(snapshot_path(self.db).read_text())
+        self.assertIn("standing", final_row["final_instruction"])
+        self.assertEqual(final_row["annotator_email"], "stable@example.com")
+        status, result = self.request(
+            self.admin,
+            "/api/admin/users/update",
+            {"user_id": uid, "email": "updated@example.com"},
+            self.admin_csrf,
+        )
+        self.assertEqual(status, 200, result)
+        self.assertEqual(
+            json.loads(snapshot_path(self.db).read_text())["annotator_email"],
+            "updated@example.com",
+        )
+
+    def test_llm_requires_human_drafts_before_calling_model(self):
+        text = json.dumps(sample("draft-required"))
+        self.request(
+            self.admin,
+            "/api/admin/import",
+            {"text": text, "commit": True},
+            self.admin_csrf,
+        )
+        self.request(
+            self.admin,
+            "/api/admin/users",
+            {"username": "draft-worker", "password": "strong worker pass"},
+            self.admin_csrf,
+        )
+        status, users = self.request(self.admin, "/api/admin/users")
+        uid = next(u["id"] for u in users["users"] if u["username"] == "draft-worker")
+        self.request(
+            self.admin,
+            "/api/admin/assign",
+            {"ids": ["draft-required"], "assignee_id": uid},
+            self.admin_csrf,
+        )
+        csrf = self.login(self.worker, "draft-worker", "strong worker pass")
+        status, fetched = self.request(self.worker, "/api/work/tasks/draft-required")
+        revision = fetched["task"]["revision"]
+        self.server.RequestHandlerClass.gemini_key = "test-key"
+        self.server.RequestHandlerClass.gemini_model = "test-model"
+
+        with patch("server.gemini_suggestion") as model:
+            empty_select = annotation("INDIVIDUAL", ["1"], target="S1 đang cầm bằng")
+            empty_select["select_texts"] = [""]
+            status, result = self.request(
+                self.worker,
+                "/api/work/tasks/draft-required/suggest",
+                {
+                    "expected_revision": revision,
+                    "annotation": empty_select,
+                },
+                csrf,
+            )
+            self.assertEqual(status, 422, result)
+            self.assertIn("every SELECT", result["error"])
+            model.assert_not_called()
+
+        with patch("server.gemini_suggestion") as model:
+            status, result = self.request(
+                self.worker,
+                "/api/work/tasks/draft-required/suggest",
+                {
+                    "expected_revision": revision,
+                    "annotation": annotation("INDIVIDUAL", ["1"], target=""),
+                },
+                csrf,
+            )
+            self.assertEqual(status, 422, result)
+            self.assertIn("TARGET draft", result["error"])
+            model.assert_not_called()
 
     def test_llm_temporary_suggestion_and_revision(self):
         text = json.dumps(sample("fix"))
@@ -677,6 +886,8 @@ class ServerTests(unittest.TestCase):
         revision = fetched["task"]["revision"]
         self.server.RequestHandlerClass.gemini_key = "test-key"
         self.server.RequestHandlerClass.gemini_model = "test-model"
+        # Fix with LLM is text-only and must not depend on image storage.
+        self.server.RequestHandlerClass.image_root = None
         proposed = {
             "select_texts": ["the man in black"],
             "target_condition": "Subject 1 is holding a diploma",
@@ -688,13 +899,21 @@ class ServerTests(unittest.TestCase):
                 "/api/work/tasks/fix/suggest",
                 {
                     "expected_revision": revision,
-                    "annotation": annotation("INDIVIDUAL", ["1"], target=""),
+                    "annotation": annotation(
+                        "INDIVIDUAL", ["1"], target="S1 đang cầm bằng tốt nghiệp"
+                    ),
                 },
                 csrf,
             )
         self.assertEqual(status, 200, result)
         self.assertEqual(result["suggestion"], proposed)
         self.assertEqual(model.call_count, 1)
+        args = model.call_args.args
+        self.assertEqual(args[0:2], ("test-model", "test-key"))
+        self.assertEqual(args[2], "INDIVIDUAL")
+        self.assertEqual(args[4], ["the man in black"])
+        self.assertEqual(args[5], "S1 đang cầm bằng tốt nghiệp")
+        self.assertEqual(len(args), 7)
         status, fetched = self.request(self.worker, "/api/work/tasks/fix")
         self.assertNotIn("suggestion", fetched)
         self.assertEqual(snapshot_path(self.db).read_text(), "")
@@ -704,7 +923,9 @@ class ServerTests(unittest.TestCase):
                 "/api/work/tasks/fix/suggest",
                 {
                     "expected_revision": 123,
-                    "annotation": annotation("INDIVIDUAL", ["1"], target=""),
+                    "annotation": annotation(
+                        "INDIVIDUAL", ["1"], target="S1 đang cầm bằng tốt nghiệp"
+                    ),
                 },
                 csrf,
             )
@@ -722,7 +943,9 @@ class ServerTests(unittest.TestCase):
                 "/api/work/tasks/fix/suggest",
                 {
                     "expected_revision": revision,
-                    "annotation": annotation("INDIVIDUAL", ["1"], target=""),
+                    "annotation": annotation(
+                        "INDIVIDUAL", ["1"], target="S1 đang cầm bằng tốt nghiệp"
+                    ),
                 },
                 csrf,
             )
@@ -764,6 +987,7 @@ class ServerTests(unittest.TestCase):
     def test_imported_submitted_task_appears_in_final_jsonl(self):
         existing = sample("already-done")
         existing["imported_annotation"] = annotation("INDIVIDUAL", ["1"])
+        existing["annotator_email"] = "legacy@example.com"
         status, result = self.request(
             self.admin,
             "/api/admin/import",
@@ -779,6 +1003,7 @@ class ServerTests(unittest.TestCase):
         ]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["sample_id"], "already-done")
+        self.assertEqual(rows[0]["annotator_email"], "legacy@example.com")
         self.assertEqual(
             rows[0]["final_instruction"],
             rows[0]["final_desc"] + "; " + rows[0]["final_change"] + ".",
@@ -791,7 +1016,7 @@ class ServerTests(unittest.TestCase):
 
     def prepare_worker(self, ids):
         status, result = self.request(self.admin, "/api/admin/users",
-            {"username": "stable", "password": "password"}, self.admin_csrf)
+            {"username": "stable", "email": "stable@example.com", "password": "password"}, self.admin_csrf)
         self.assertEqual(status, 201, result)
         _, users = self.request(self.admin, "/api/admin/users")
         uid = next(u["id"] for u in users["users"] if u["username"] == "stable")
@@ -853,6 +1078,14 @@ class ServerTests(unittest.TestCase):
         status, _ = self.request(self.admin, "/api/admin/users/update",
             {"user_id": uid, "password": "changed", "active": "no"}, self.admin_csrf)
         self.assertEqual(status, 422)
+        status, _ = self.request(self.admin, "/api/admin/users/update",
+            {"user_id": uid, "email": "not an email"}, self.admin_csrf)
+        self.assertEqual(status, 422)
+        _, users = self.request(self.admin, "/api/admin/users")
+        self.assertEqual(
+            next(u for u in users["users"] if u["id"] == uid)["email"],
+            "stable@example.com",
+        )
         self.login(self.worker, "stable", "password")
         for value in ({"ids": [{}]}, {"ids": ["valid"], "assignee_id": []}):
             status, result = self.request(self.admin, "/api/admin/assign", value, self.admin_csrf)

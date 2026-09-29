@@ -2,18 +2,23 @@
 
 const $ = id => document.getElementById(id);
 const CASES = ["INDIVIDUAL", "GROUP", "DUAL", "RELATIONAL"];
+// Each page owns its draft slot; one tab must not erase another tab's work.
+const draftWriter = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 const state = {
   user: null, csrf: "", llm: false, users: [], adminTasks: [], offset: 0,
   selected: new Set(), importText: "", importReady: false, importBusy: false, adminRequest: 0,
   queue: [], queueVisible: 300, current: null, task: null, annotation: null, assignment: new Map(),
   activeSubject: 1, workStatus: "pending", workSearch: "", workCase: "",
   dirty: false, version: 0, saving: null, saveTimer: null, loading: false,
-  suggestion: null, suggesting: false, submitting: false,
+  suggestion: null, suggesting: false, submitting: false, reopening: false,
+  reopenedTask: null,
   session: 0, loggingOut: false, recovery: null, storageWarning: false,
+  taskGeneration: 0,
+  recoverySource: null,
   view: { query: { scale: 1, x: 0, y: 0 }, target: { scale: 1, x: 0, y: 0 } },
 };
 
-async function api(path, options = {}) {
+async function api(path, options = {}, download = false) {
   const session = state.session, controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), path.endsWith('/suggest') ? 75000 : 30000);
   try {
@@ -25,6 +30,11 @@ async function api(path, options = {}) {
       ...options.headers },
   });
   if (session !== state.session) throw new Error("Phiên đăng nhập đã thay đổi.");
+  if (download && response.ok) {
+    const blob = await response.blob();
+    if (session !== state.session) throw new Error("Phiên đăng nhập đã thay đổi.");
+    return { blob, count: response.headers.get("X-Export-Count") };
+  }
   const data = await response.json().catch(() => {
     throw new Error(`Phản hồi server không hợp lệ (HTTP ${response.status}). Hãy thử lại.`);
   });
@@ -47,13 +57,21 @@ function showLogin() {
   persistLocalDraft();
   clearTimeout(state.saveTimer);
   state.session += 1;
+  state.taskGeneration += 1;
   state.user = null;
   state.csrf = "";
   state.current = null; state.task = null; state.annotation = null;
-  state.queue = []; state.assignment = new Map(); state.recovery = null;
+  state.reopenedTask = null;
+  state.queue = []; state.assignment = new Map(); state.recovery = null; state.recoverySource = null;
   state.dirty = false; state.saving = null; state.loading = false;
-  state.submitting = false; state.suggesting = false; state.loggingOut = false;
+  state.submitting = false; state.suggesting = false; state.reopening = false; state.loggingOut = false;
   state.suggestion = null; state.selected.clear();
+  state.users = []; state.adminTasks = []; state.offset = 0;
+  state.importText = ""; state.importReady = false;
+  $("importFile").value = ""; $("importResult").textContent = "";
+  $("commitImport").disabled = true;
+  $("createUsersBulk").reset(); resetCreateUserForm();
+  $("userRows").replaceChildren(); $("taskRows").replaceChildren();
   $("loginForm").reset();
   $("taskEditor").hidden = true; $("emptyWork").hidden = false;
   $("logout").disabled = false;
@@ -70,18 +88,97 @@ function showApp(me) {
   $("roleLabel").textContent = me.user.role === "ADMIN" ? "Administration" : "Annotation workspace";
   $("admin").hidden = me.user.role !== "ADMIN";
   $("work").hidden = me.user.role !== "ANNOTATOR";
-  if (me.user.role === "ADMIN") return loadAdmin();
+  if (me.user.role === "ADMIN") {
+    resetCreateUserForm();
+    return loadAdmin();
+  }
+  const queuePreference = stored("rcr:queueCollapsed");
+  setQueueCollapsed(queuePreference === "1" ||
+    (queuePreference === null && !!window.matchMedia?.("(max-width: 1200px)").matches));
   return loadQueue();
 }
 
-function localKey(sid = state.current) {
+function setQueueCollapsed(collapsed) {
+  $("work").classList.toggle("queue-collapsed", collapsed);
+  $("toggleQueue").textContent = collapsed ? "›" : "‹";
+  $("toggleQueue").title = collapsed ? "Mở hàng đợi" : "Thu gọn hàng đợi";
+  $("toggleQueue").setAttribute("aria-label", $("toggleQueue").title);
+  $("toggleQueue").setAttribute("aria-expanded", String(!collapsed));
+  $("queueContent").hidden = collapsed;
+  try { localStorage.setItem("rcr:queueCollapsed", collapsed ? "1" : "0"); } catch { /* Optional. */ }
+  // The image container changes width when the queue closes or opens.
+  requestAnimationFrame(() => {
+    for (const side of ["query", "target"]) fitImage(side);
+  });
+}
+
+function localPrefix(sid = state.current) {
   return `rcr:draft:${state.user?.id}:${sid}`;
 }
+function localKey(sid = state.current) { return `${localPrefix(sid)}:${draftWriter}`; }
 function stored(key) {
   try { return localStorage.getItem(key); } catch { return null; }
 }
+function reopenedKey(sid = state.current) {
+  return `rcr:reopened:${state.user?.id}:${sid}`;
+}
+function rememberReopenedTask(task) {
+  state.reopenedTask = task.sample_id;
+  try {
+    localStorage.setItem(reopenedKey(task.sample_id), JSON.stringify({
+      sample_id: task.sample_id, revision: task.revision,
+    }));
+  } catch { /* The in-memory marker still covers the current session. */ }
+}
+function restoreReopenedMarker(task) {
+  state.reopenedTask = null;
+  if (task.status !== "SUBMITTED" && task.reopened) {
+    rememberReopenedTask(task);
+    return;
+  }
+  try {
+    const marker = JSON.parse(stored(reopenedKey(task.sample_id)) || "null");
+    if (marker?.sample_id === task.sample_id && marker.revision === task.revision) {
+      state.reopenedTask = task.sample_id;
+    } else localStorage.removeItem(reopenedKey(task.sample_id));
+  } catch {
+    try { localStorage.removeItem(reopenedKey(task.sample_id)); } catch { /* Optional. */ }
+  }
+}
+function clearReopenedMarker(sid = state.current) {
+  if (state.reopenedTask === sid) state.reopenedTask = null;
+  try { localStorage.removeItem(reopenedKey(sid)); } catch { /* Optional. */ }
+}
 function removeLocalDraft(sid = state.current) {
   try { localStorage.removeItem(localKey(sid)); } catch { /* Server data is authoritative. */ }
+}
+function removeRecoverySource(source) {
+  if (!source) return;
+  try {
+    if (stored(source.key) === source.text) localStorage.removeItem(source.key);
+  } catch { /* Keep the recovery copy if storage is unavailable. */ }
+}
+function findRecoveryDraft() {
+  const prefix = localPrefix(), candidates = [], confirmed = [];
+  const current = JSON.stringify(currentAnnotation());
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key !== prefix && !key?.startsWith(`${prefix}:`)) continue;
+      try {
+        const text = stored(key), record = JSON.parse(text);
+        if (record?.sample_id !== state.current || !record.annotation ||
+            !Array.isArray(record.annotation.subjects) || !Array.isArray(record.annotation.select_texts)) continue;
+        if (JSON.stringify(record.annotation) !== current) candidates.push({ record, key, text });
+        else confirmed.push({ key, text });
+      } catch { /* A broken cache entry must not hide other valid drafts. */ }
+    }
+  } catch { return; }
+  confirmed.forEach(removeRecoverySource);
+  candidates.sort((a, b) => (b.record.updated_at || 0) - (a.record.updated_at || 0));
+  const latest = candidates[0];
+  state.recovery = latest ? latest.record : null;
+  state.recoverySource = latest ? { key: latest.key, text: latest.text } : null;
 }
 function persistLocalDraft() {
   if (!state.user || !state.task || !state.dirty || state.recovery) return;
@@ -102,7 +199,7 @@ function downloadDraft(record = null) {
   const link = document.createElement("a"); link.href = url; link.download = "rcr-draft-recovery.json";
   link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-const busy = () => state.loading || state.submitting || state.loggingOut;
+const busy = () => state.loading || state.submitting || state.reopening || state.loggingOut;
 const editingBlocked = () => busy() || !!state.recovery;
 function fillAnnotation(annotation) {
   state.annotation = annotation;
@@ -128,6 +225,11 @@ function toast(message) {
   node.hidden = false;
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => { node.hidden = true; }, 6500);
+}
+function resetCreateUserForm() {
+  const form = $("createUser");
+  form.reset();
+  form.querySelectorAll("input").forEach(input => { input.value = ""; });
 }
 function timeLabel(seconds) {
   return seconds ? new Date(seconds * 1000).toLocaleString("vi-VN") : "—";
@@ -168,13 +270,22 @@ async function loadUsers() {
   const root = $("userRows"); root.replaceChildren();
   for (const user of state.users) {
     const row = document.createElement("tr");
-    td(row, user.username); td(row, user.role); td(row, user.assigned);
+    td(row, user.username); td(row, user.email); td(row, user.role); td(row, user.assigned);
     td(row, user.pending); td(row, user.in_progress);
     td(row, user.completed); td(row, user.ever_completed);
     td(row, user.assigned ? `${Math.round(100 * user.completed / user.assigned)}%` : "0%");
     td(row, user.active ? "Hoạt động" : "Đã khóa");
     const actions = document.createElement("td");
     if (user.role === "ANNOTATOR") {
+      const setEmail = document.createElement("button"); setEmail.textContent = "Đặt email";
+      setEmail.onclick = async () => {
+        const email = prompt(`Email cho ${user.username}:`, user.email || "");
+        if (email === null) return;
+        try { const result = await post("/api/admin/users/update", { user_id: user.id, email });
+          await loadUsers(); toast(result.backup_warning ||
+            (email.trim() ? "Đã cập nhật email." : "Đã xóa email.")); }
+        catch (error) { toast(error.message); }
+      };
       const reset = document.createElement("button"); reset.textContent = "Đặt lại mật khẩu";
       reset.onclick = async () => {
         const password = prompt(`Mật khẩu mới cho ${user.username} (ít nhất 4 ký tự):`);
@@ -191,7 +302,7 @@ async function loadUsers() {
           await loadUsers(); toast("Đã cập nhật user."); }
         catch (error) { toast(error.message); }
       };
-      actions.append(reset, document.createTextNode(" "), toggle);
+      actions.append(setEmail, document.createTextNode(" "), reset, document.createTextNode(" "), toggle);
     }
     row.appendChild(actions); root.appendChild(row);
   }
@@ -301,14 +412,12 @@ async function importPreview(commit) {
 async function exportResults() {
   try {
     const query = filters(); query.delete("status");
-    const response = await fetch(`/api/admin/export?${query}`, { credentials: "same-origin" });
-    if (!response.ok) throw new Error((await response.json()).error);
-    const blob = await response.blob();
+    const { blob, count } = await api(`/api/admin/export?${query}`, {}, true);
     if (!blob.size) { toast("Bộ lọc hiện tại chưa có task đã nộp."); return; }
     const url = URL.createObjectURL(blob), a = document.createElement("a");
     a.href = url; a.download = "rcr-submitted.jsonl"; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast(`Đã export ${response.headers.get("X-Export-Count")} task đã nộp.`);
+    toast(`Đã export ${count} task đã nộp.`);
   } catch (error) { toast(error.message); }
 }
 
@@ -410,7 +519,9 @@ function navigate(delta) {
 }
 async function loadTask(sid) {
   const response = await api(`/api/work/tasks/${encodeURIComponent(sid)}`);
+  state.taskGeneration += 1;
   state.current = sid; state.task = response.task;
+  restoreReopenedMarker(state.task);
   state.annotation = response.annotation || {
     case_type: state.task.case_type,
     subjects: state.task.initial_subjects.length ? state.task.initial_subjects :
@@ -420,15 +531,8 @@ async function loadTask(sid) {
       state.task.case_type === "RELATIONAL" ? [""] : [])], target_condition: "",
   };
   fillAnnotation(state.annotation);
-  state.recovery = null;
-  try {
-    const local = JSON.parse(stored(localKey(sid)) || "null");
-    if (local && local.sample_id === sid && local.annotation &&
-        Array.isArray(local.annotation.subjects) && Array.isArray(local.annotation.select_texts)) {
-      if (JSON.stringify(local.annotation) !== JSON.stringify(currentAnnotation())) state.recovery = local;
-      else removeLocalDraft(sid);
-    }
-  } catch { /* Ignore invalid browser cache; keep server copy usable. */ }
+  state.recovery = null; state.recoverySource = null;
+  findRecoveryDraft();
   state.activeSubject = 1; state.dirty = false; state.version = 0;
   clearTimeout(state.saveTimer);
   $("workTitle").textContent = `Task ${state.queue.findIndex(t => t.sample_id === sid) + 1} / ${state.queue.length}`;
@@ -451,8 +555,38 @@ async function loadTask(sid) {
 function showSuggestion(suggestion) {
   state.suggestion = suggestion;
   $("suggestion").hidden = !suggestion;
+  const fields = $("suggestionFields");
+  fields.replaceChildren();
   if (!suggestion) return;
-  $("suggestionText").textContent = suggestion.final_instruction;
+  const entries = [
+    ["Subject 1", "select1", suggestion.select_texts?.[0]],
+    ...(isTwo() ? [["Subject 2", "select2", suggestion.select_texts?.[1]]] : []),
+    ["Target condition", "targetText", suggestion.target_condition],
+  ];
+  for (const [label, id, value] of entries) {
+    if (typeof value !== "string") continue;
+    const row = document.createElement("div"); row.className = "suggestion-row";
+    const heading = document.createElement("div"); heading.className = "suggestion-heading";
+    const name = document.createElement("strong"); name.textContent = label;
+    const apply = document.createElement("button"); apply.type = "button";
+    apply.textContent = "Áp dụng"; apply.dataset.applyTo = id;
+    apply.onclick = () => applySuggestion(id, value, apply);
+    const content = document.createElement("p"); content.textContent = value;
+    heading.append(name, apply); row.append(heading, content); fields.append(row);
+  }
+  updateSuggestionButtons();
+}
+function updateSuggestionButtons() {
+  const blocked = !state.task || state.task.status === "SUBMITTED" || editingBlocked();
+  $("suggestionFields").querySelectorAll("[data-apply-to]").forEach(button => {
+    button.disabled = blocked || button.classList.contains("applied");
+  });
+}
+function applySuggestion(id, value, button) {
+  if (!state.suggestion || !state.task || state.task.status === "SUBMITTED" || editingBlocked()) return;
+  $(id).value = value;
+  button.classList.add("applied"); button.textContent = "✓ Đã áp dụng";
+  markDirty(); updateSuggestionButtons();
 }
 function syncCase() {
   if (!state.annotation) return;
@@ -513,6 +647,21 @@ function currentAnnotation() {
     target_condition: $("targetText").value,
   };
 }
+function hasLlmDraft() {
+  if (!state.task) return false;
+  const a = currentAnnotation();
+  return a.select_texts.every(text => text.trim()) && a.target_condition.trim();
+}
+function updateSuggestButton() {
+  if (!state.task) return;
+  const completed = state.task.status === "SUBMITTED", blocked = editingBlocked();
+  $("suggestBtn").disabled = completed || blocked || !state.llm || state.suggesting || !hasLlmDraft();
+  $("suggestBtn").title = !state.llm
+    ? "Cần cấu hình Gemini trên server"
+    : !hasLlmDraft()
+      ? "Hãy gạch ý cho tất cả SELECT và TARGET trước; có thể viết tiếng Việt"
+      : "Sửa/dịch bản nháp sang tiếng Anh và chuẩn hóa format RCR";
+}
 function renderPreview() {
   if (!state.task) return;
   const a = currentAnnotation(), desc1 = cleanSlot(a.select_texts[0]),
@@ -566,9 +715,14 @@ function renderWork() {
   for (const id of ["select1", "select2", "targetText"]) $(id).readOnly = completed || blocked;
   $("saveDraft").disabled = completed || blocked;
   $("submitTask").disabled = completed || blocked || state.suggesting;
-  $("suggestBtn").disabled = completed || blocked || !state.llm || state.suggesting;
-  $("suggestBtn").title = state.llm ? "Tạo gợi ý SELECT và TARGET, cần kiểm tra trước khi áp dụng" : "Cần cấu hình Gemini trên server";
-  $("useSuggestion").disabled = completed || blocked || !state.suggestion;
+  $("submitTask").textContent = state.reopenedTask === state.current
+    ? "Nộp lại" : "Nộp & task tiếp theo";
+  $("reopenTask").hidden = !completed;
+  $("reopenTask").disabled = !completed || blocked;
+  $("saveDraft").hidden = completed;
+  $("submitTask").hidden = completed;
+  updateSuggestButton();
+  updateSuggestionButtons();
   $("refreshQueue").disabled = busy();
   renderBoxes(); renderPreview();
 }
@@ -584,6 +738,7 @@ function markDirty() {
     $("saveState").textContent = "Lưu nháp thất bại";
   }), 900);
   renderPreview();
+  updateSuggestButton();
 }
 async function saveOnce() {
   const version = state.version, sid = state.current, session = state.session;
@@ -596,10 +751,12 @@ async function saveOnce() {
     const result = await pending;
     if (state.current !== sid || session !== state.session) return;
     state.task = { ...state.task, ...result.task };
+    if (state.reopenedTask === sid) rememberReopenedTask(state.task);
     if (state.version === version) state.annotation = result.annotation;
     if (state.version === version) {
       state.dirty = false; $("saveState").textContent = "Đã lưu nháp";
       removeLocalDraft(sid);
+      removeRecoverySource(state.recoverySource); state.recoverySource = null;
     } else $("saveState").textContent = "Có thay đổi mới…";
     persistLocalDraft();
     updateMeta(result.task);
@@ -615,31 +772,35 @@ async function flushDraft() {
 }
 async function submitTask() {
   if (!state.task || state.task.status === "SUBMITTED" || editingBlocked() || state.suggesting) return;
+  const sid = state.current, isResubmission = state.reopenedTask === sid;
   state.submitting = true;
   renderWork(); renderQueue();
   try {
     $("workError").textContent = "";
     await flushDraft();
-    const result = await post(`/api/work/tasks/${encodeURIComponent(state.current)}/submit`, {
+    const result = await post(`/api/work/tasks/${encodeURIComponent(sid)}/submit`, {
       expected_revision: state.task.revision, annotation: currentAnnotation(),
     });
     state.task = { ...state.task, ...result.task };
     state.annotation = result.annotation;
     showSuggestion(null);
     state.dirty = false;
-    removeLocalDraft();
-    $("saveState").textContent = "Đã nộp";
+    removeLocalDraft(sid);
+    clearReopenedMarker(sid);
+    $("saveState").textContent = isResubmission ? "Đã nộp lại" : "Đã nộp";
     updateMeta(result.task);
     if (result.backup_warning) {
       $("workError").textContent = result.backup_warning;
       alert(result.backup_warning);
     }
     renderWork();
-    const next = filteredQueue().find(t => t.status !== "SUBMITTED");
     state.submitting = false;
-    if (next) await switchTask(next.sample_id);
-    else $("saveState").textContent = state.queue.some(t => t.status !== "SUBMITTED")
-      ? "Đã xong các task trong bộ lọc này." : "Bạn đã hoàn thành tất cả task được giao.";
+    if (!isResubmission) {
+      const next = filteredQueue().find(t => t.status !== "SUBMITTED");
+      if (next) await switchTask(next.sample_id);
+      else $("saveState").textContent = state.queue.some(t => t.status !== "SUBMITTED")
+        ? "Đã xong các task trong bộ lọc này." : "Bạn đã hoàn thành tất cả task được giao.";
+    }
   } catch (error) { $("workError").textContent = error.message; }
   finally {
     state.submitting = false;
@@ -647,9 +808,39 @@ async function submitTask() {
     renderQueue();
   }
 }
+async function reopenTask() {
+  if (!state.task || state.task.status !== "SUBMITTED" || busy()) return;
+  const sid = state.current;
+  state.reopening = true;
+  renderWork(); renderQueue();
+  try {
+    $("workError").textContent = "";
+    const result = await post(`/api/work/tasks/${encodeURIComponent(sid)}/reopen`, {
+      expected_revision: state.task.revision,
+    });
+    if (state.current !== sid) return;
+    state.task = { ...state.task, ...result.task };
+    rememberReopenedTask(state.task);
+    fillAnnotation(result.annotation);
+    showSuggestion(null);
+    state.dirty = false; state.version = 0;
+    $("saveState").textContent = "Đã mở lại · có thể tiếp tục sửa";
+    updateMeta(result.task);
+    if (result.backup_warning) $("workError").textContent = result.backup_warning;
+  } catch (error) { $("workError").textContent = error.message; }
+  finally {
+    state.reopening = false;
+    if (state.task) renderWork();
+    renderQueue();
+  }
+}
 async function suggest() {
   if (!state.task || !state.llm || state.suggesting || editingBlocked() || state.task.status === "SUBMITTED") return;
-  const sid = state.current;
+  if (!hasLlmDraft()) {
+    $("workError").textContent = "Hãy gạch ý cho tất cả SELECT và TARGET trước khi dùng Fix with LLM. Bạn có thể viết bằng tiếng Việt; LLM sẽ sửa/dịch sang tiếng Anh.";
+    return;
+  }
+  const sid = state.current, generation = state.taskGeneration, session = state.session;
   state.suggesting = true;
   $("suggestBtn").disabled = true;
   $("submitTask").disabled = true;
@@ -657,7 +848,7 @@ async function suggest() {
   $("workError").textContent = "";
   try {
     await flushDraft();
-    if (state.current !== sid) return;
+    if (state.current !== sid || generation !== state.taskGeneration) return;
     const version = state.version;
     const original = currentAnnotation();
     const subjectSignature = JSON.stringify([original.case_type, original.subjects]);
@@ -665,7 +856,7 @@ async function suggest() {
       expected_revision: state.task.revision,
       annotation: original, note: $("llmNote").value,
     });
-    if (state.current !== sid) return;
+    if (state.current !== sid || generation !== state.taskGeneration) return;
     const current = currentAnnotation();
     if (subjectSignature !== JSON.stringify([current.case_type, current.subjects])) {
       $("workError").textContent = "Subject/case đã đổi trong lúc LLM chạy; hãy tạo gợi ý mới.";
@@ -676,13 +867,14 @@ async function suggest() {
       $("workError").textContent = "Bạn đã sửa bài trong lúc LLM chạy; kiểm tra kỹ đề xuất trước khi áp dụng.";
     } else if (result.backup_warning) $("workError").textContent = result.backup_warning;
   } catch (error) {
-    if (state.current === sid) $("workError").textContent = error.message;
+    if (state.current === sid && generation === state.taskGeneration) $("workError").textContent = error.message;
   }
   finally {
-    state.suggesting = false;
-    $("suggestBtn").textContent = "✦ Fix with LLM";
-    $("suggestBtn").disabled = !state.llm || state.submitting || state.task?.status === "SUBMITTED";
-    if (state.task) renderWork();
+    if (session === state.session) {
+      state.suggesting = false;
+      $("suggestBtn").textContent = "✦ Fix with LLM";
+      if (state.task) renderWork();
+    }
   }
 }
 function applyView(side) {
@@ -735,7 +927,7 @@ function setupViewport(side) {
 function bindEvents() {
   window.addEventListener("beforeunload", event => {
     persistLocalDraft();
-    if (state.dirty || state.saving || state.submitting) {
+    if (state.dirty || state.saving || state.submitting || state.reopening) {
       event.preventDefault();
       event.returnValue = "";
     }
@@ -772,7 +964,10 @@ function bindEvents() {
     document.querySelectorAll("[data-tab]").forEach(b => b.classList.toggle("active", b === button));
     $("adminTasks").hidden = button.dataset.tab !== "tasks";
     $("adminUsers").hidden = button.dataset.tab !== "users";
-    if (button.dataset.tab === "users") loadUsers().catch(e => toast(e.message));
+    if (button.dataset.tab === "users") {
+      resetCreateUserForm();
+      loadUsers().catch(e => toast(e.message));
+    }
   });
   $("createUser").onsubmit = async event => {
     event.preventDefault();
@@ -822,12 +1017,19 @@ function bindEvents() {
     catch (error) { $("workError").textContent = error.message; }
   };
   $("workCase").onchange = e => { state.workCase = e.target.value; renderQueue(); };
+  $("toggleQueue").onclick = () => setQueueCollapsed(!$("work").classList.contains("queue-collapsed"));
   $("prevTask").onclick = () => navigate(-1);
   $("nextTask").onclick = () => navigate(1);
   document.querySelectorAll("[data-case-mode]").forEach(button => button.onclick = () => setCase(button.dataset.caseMode));
   $("subject1").onclick = () => { state.activeSubject = 1; renderWork(); };
   $("subject2").onclick = () => { state.activeSubject = 2; renderWork(); };
-  for (const id of ["select1", "select2", "targetText"]) $(id).oninput = markDirty;
+  for (const id of ["select1", "select2", "targetText"]) $(id).oninput = () => {
+    const applied = $("suggestionFields").querySelector(`[data-apply-to="${id}"]`);
+    if (applied?.classList.contains("applied")) {
+      applied.classList.remove("applied"); applied.textContent = "Áp dụng";
+    }
+    markDirty();
+  };
   $("saveDraft").onclick = () => flushDraft().catch(e => { $("workError").textContent = e.message; });
   $("reloadTask").onclick = async () => {
     if (!state.task || busy()) return;
@@ -844,24 +1046,13 @@ function bindEvents() {
   $("restoreLocal").onclick = restoreLocalDraft;
   $("discardLocal").onclick = () => {
     if (!confirm("Bỏ bản nháp dự phòng trên trình duyệt và dùng bản đã lưu trên server?")) return;
-    removeLocalDraft(); state.recovery = null; renderWork();
+    removeRecoverySource(state.recoverySource);
+    state.recovery = null; state.recoverySource = null;
+    findRecoveryDraft(); renderWork();
   };
   $("submitTask").onclick = submitTask;
+  $("reopenTask").onclick = reopenTask;
   $("suggestBtn").onclick = suggest;
-  $("useSuggestion").onclick = async () => {
-    if (!state.suggestion || state.task.status === "SUBMITTED" || editingBlocked()) return;
-    const suggestion = state.suggestion;
-    const existing = [$("select1").value, ...(isTwo() ? [$("select2").value] : []),
-      $("targetText").value];
-    if (existing.some(text => text.trim()) &&
-        !confirm("Thay SELECT và TARGET hiện tại bằng đề xuất của LLM rồi lưu nháp?")) return;
-    $("select1").value = suggestion.select_texts[0];
-    if (isTwo()) $("select2").value = suggestion.select_texts[1];
-    $("targetText").value = suggestion.target_condition;
-    markDirty();
-    try { await flushDraft(); $("suggestion").hidden = true; }
-    catch (error) { $("workError").textContent = error.message; }
-  };
   for (const side of ["query", "target"]) {
     setupViewport(side);
     $(`${side}Image`).onload = () => fitImage(side);
